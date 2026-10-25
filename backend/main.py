@@ -341,7 +341,7 @@ Analyze the claim against the warranty text and respond with JSON only."""
 def _parse_llm_response(raw: str) -> dict:
     """
     Robustly extract JSON from the LLM output.
-    Handles markdown fences, leading text, thinking tags, etc.
+    Handles markdown fences, leading text, thinking tags, and partial/truncated JSON.
     """
     if not raw or not raw.strip():
         raise ValueError("LLM returned empty content.")
@@ -352,16 +352,15 @@ def _parse_llm_response(raw: str) -> dict:
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
 
-    # Try direct parse
+    # 1. Try direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Try to find a JSON object in the text
+    # 2. Try to find a complete JSON object in the text
     matches = list(re.finditer(r"\{[\s\S]*\}", cleaned))
     if matches:
-        # Try the longest match first
         for m in sorted(matches, key=lambda x: len(x.group(0)), reverse=True):
             candidate = m.group(0)
             try:
@@ -373,6 +372,34 @@ def _parse_llm_response(raw: str) -> dict:
                     return json.loads(fixed)
                 except json.JSONDecodeError:
                     pass
+
+    # 3. Fallback: Salvage truncated JSON by extracting fields with regex
+    status_match = re.search(r'"status"\s*:\s*"([A-Za-z_]+)"', cleaned)
+    if status_match:
+        status = status_match.group(1).upper()
+        # Extract summary up to closing quote or end of string
+        summary_match = re.search(r'"summary"\s*:\s*"([^"\n\r\\]*(?:\\.[^"\n\r\\]*)*)', cleaned)
+        summary = summary_match.group(1) if summary_match else "Analysis completed."
+
+        # Extract any quotes that made it into evidence
+        evidence = []
+        quote_matches = re.finditer(r'"quote"\s*:\s*"([^"\n\r\\]*(?:\\.[^"\n\r\\]*)*)"', cleaned)
+        for qm in quote_matches:
+            evidence.append({"quote": qm.group(1), "page": None})
+
+        # Extract follow up questions if any
+        follow_ups = []
+        fu_matches = re.findall(r'"([^"?\n\r]*\?)"', cleaned)
+        for fu in fu_matches:
+            if len(fu) > 10 and fu not in follow_ups:
+                follow_ups.append(fu)
+
+        return {
+            "status": status,
+            "summary": summary,
+            "evidence": evidence,
+            "follow_up_questions": follow_ups or ["Does your warranty include optional accidental damage coverage?"],
+        }
 
     raise ValueError(f"Could not parse LLM output as JSON. Raw preview: {raw[:300]}")
 
@@ -391,22 +418,11 @@ def _real_analyze(client, warranty_pages: list[dict], user_claim: str) -> Analys
         response = client.chat.completions(
             model="sarvam-105b",
             messages=messages,
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=0.1,
         )
         msg = response.choices[0].message
         raw_content = getattr(msg, "content", None) or getattr(msg, "reasoning_content", None) or ""
-
-        # If reasoning consumed all tokens and hit length limit, retry with higher token budget
-        if not raw_content.strip() and response.choices[0].finish_reason == "length":
-            response = client.chat.completions(
-                model="sarvam-105b",
-                messages=messages,
-                max_tokens=8192,
-                temperature=0.1,
-            )
-            msg = response.choices[0].message
-            raw_content = getattr(msg, "content", None) or getattr(msg, "reasoning_content", None) or ""
 
     except Exception as exc:
         raise HTTPException(502, f"Sarvam chat API error: {exc}") from exc
