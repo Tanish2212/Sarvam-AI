@@ -306,6 +306,7 @@ Your task:
   INSUFFICIENT_EVIDENCE — the warranty text does not contain enough information to confirm or deny the claim.
 
 CRITICAL RULES:
+- Keep your internal reasoning concise and directly output the final JSON answer.
 - If the warranty text simply does not mention the topic of the claim, classify as INSUFFICIENT_EVIDENCE, NOT as CONTRADICTED.
 - Every piece of evidence MUST be an exact quote copied from the warranty text. Do NOT invent or paraphrase quotes.
 - If you cannot determine the page number for a quote, set "page" to null. Do NOT guess page numbers.
@@ -340,10 +341,15 @@ Analyze the claim against the warranty text and respond with JSON only."""
 def _parse_llm_response(raw: str) -> dict:
     """
     Robustly extract JSON from the LLM output.
-    Handles markdown fences, leading text, etc.
+    Handles markdown fences, leading text, thinking tags, etc.
     """
+    if not raw or not raw.strip():
+        raise ValueError("LLM returned empty content.")
+
+    # Strip thinking/reasoning tags if any leaked into content
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw.strip(), flags=re.MULTILINE)
     # Strip markdown code fences if present
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
 
     # Try direct parse
@@ -353,14 +359,22 @@ def _parse_llm_response(raw: str) -> dict:
         pass
 
     # Try to find a JSON object in the text
-    match = re.search(r"\{[\s\S]*\}", cleaned)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+    matches = list(re.finditer(r"\{[\s\S]*\}", cleaned))
+    if matches:
+        # Try the longest match first
+        for m in sorted(matches, key=lambda x: len(x.group(0)), reverse=True):
+            candidate = m.group(0)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # Clean trailing commas
+                fixed = re.sub(r",\s*([\]}])", r"\1", candidate)
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    pass
 
-    raise ValueError("Could not parse LLM output as JSON.")
+    raise ValueError(f"Could not parse LLM output as JSON. Raw preview: {raw[:300]}")
 
 
 def _real_analyze(client, warranty_pages: list[dict], user_claim: str) -> AnalysisResponse:
@@ -377,20 +391,32 @@ def _real_analyze(client, warranty_pages: list[dict], user_claim: str) -> Analys
         response = client.chat.completions(
             model="sarvam-105b",
             messages=messages,
-            max_tokens=2048,
+            max_tokens=4096,
             temperature=0.1,
         )
         msg = response.choices[0].message
         raw_content = getattr(msg, "content", None) or getattr(msg, "reasoning_content", None) or ""
+
+        # If reasoning consumed all tokens and hit length limit, retry with higher token budget
+        if not raw_content.strip() and response.choices[0].finish_reason == "length":
+            response = client.chat.completions(
+                model="sarvam-105b",
+                messages=messages,
+                max_tokens=8192,
+                temperature=0.1,
+            )
+            msg = response.choices[0].message
+            raw_content = getattr(msg, "content", None) or getattr(msg, "reasoning_content", None) or ""
+
     except Exception as exc:
         raise HTTPException(502, f"Sarvam chat API error: {exc}") from exc
 
     try:
         parsed = _parse_llm_response(raw_content)
-    except ValueError:
+    except ValueError as val_err:
         raise HTTPException(
             502,
-            detail=f"Sarvam-105B returned unparseable output. Raw: {raw_content[:500]}",
+            detail=f"Sarvam-105B returned unparseable output: {val_err}",
         )
 
     # Validate status
