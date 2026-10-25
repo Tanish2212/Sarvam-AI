@@ -1,5 +1,7 @@
 fastapi==0.115.*
-uvicorn[standard]==0.32.*
-python-multipart==0.0.*
-sarvamai>=1.0.0
+uvicorn>=0.32.0
+python-multipart>=0.0.18
+sarvamai>=0.1.0
 python-dotenv>=1.0.0
+
+
